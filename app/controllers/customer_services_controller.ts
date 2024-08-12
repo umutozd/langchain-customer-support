@@ -1,7 +1,7 @@
 // import type { HttpContext } from '@adonisjs/core/http'
 
 import OpenAI from 'openai'
-import fs from 'fs'
+import fs, { read } from 'fs'
 
 import { HttpContext } from '@adonisjs/core/http'
 
@@ -16,14 +16,61 @@ import { createOpenAIFunctionsAgent, AgentExecutor } from 'langchain/agents'
 import Conversation from '#models/conversation'
 import { randomUUID } from 'crypto'
 import ConversationItem from '#models/conversation_item'
+import { WebSocket } from 'ws'
+import twilio from 'twilio'
+import { base64 } from '@adonisjs/core/helpers'
+import { WaveFile } from 'wavefile'
+import { Readable, Stream } from 'stream'
+import speech from '@google-cloud/speech'
 
 const openaiApiKey = process.env.OPENAI_API_KEY
+const serverUrl = 'bf41-80-147-13-93.ngrok-free.app'
+// const VoiceResponse = require('twilio').twiml.VoiceResponse
 
 const openai = new OpenAI({
   apiKey: openaiApiKey,
 })
 
+const client = new speech.SpeechClient()
+
 export default class CustomerServicesController {
+  async answerTwilioCall({ response }: HttpContext) {
+    const voiceResponse = new twilio.twiml.VoiceResponse()
+
+    const connect = voiceResponse.connect()
+    connect.stream({ url: `wss://${serverUrl}/ws` })
+
+    response.safeHeader('Content-Type', 'text/xml')
+    response.send(voiceResponse.toString())
+  }
+
+  // TODO: move this method to somewhere else because it's not a handler and this class is a controller
+  async handleTwilioWebsocket(ws: WebSocket) {
+    const recognizeStream = this.createGcpRecognizeStream()
+    ws.addEventListener('message', async (websocketEvent) => {
+      console.log('got message on websocket %s', websocketEvent.data.toString())
+
+      const data: TwilioWebsocketMessage = JSON.parse(websocketEvent.data.toString())
+      switch (data.event) {
+        case 'connected':
+          break
+        case 'start':
+          // save streamId somewhere to keep track of later
+          break
+        case 'media':
+          // save audio content
+          // const payload = base64.decode(data.media?.payload ?? '') ?? ''
+          // const wav = new WaveFile()
+          // wav.fromMuLaw(payload)
+
+          recognizeStream.push(data.media?.payload, 'base64')
+
+        default:
+          break
+      }
+    })
+  }
+
   async transcribeAudio({ response }: HttpContext) {
     console.log('transcripting')
     const result = await openai.audio.transcriptions.create({
@@ -198,4 +245,84 @@ export default class CustomerServicesController {
       text,
     })
   }
+
+  private createGcpRecognizeStream() {
+    return client
+      .streamingRecognize({
+        config: {
+          encoding: 'LINEAR16',
+          sampleRateHertz: 16000,
+          languageCode: 'fr-FR',
+          enableSpeakerDiarization: true,
+          model: 'latest_long',
+        },
+        interimResults: true,
+      })
+      .on('error', console.error)
+      .on('data', (data) => {
+        console.log('------------- data -------------')
+        for (const resultItem of data.results) {
+          for (const alternative of resultItem.alternatives) {
+            console.log(
+              `Real time transcript : ${alternative?.transcript} [isFinal: ${resultItem?.isFinal}]`
+            )
+          }
+        }
+        // console.log(
+        //   `Real time transcript : ${data.results[0]?.alternatives?.[0]?.transcript} [isFinal: ${data.results[0]?.isFinal}]`
+        // );
+        if (data.results[0]?.isFinal)
+          console.log(
+            'whole sentence :',
+            data.results[0]?.alternatives?.[0]?.words?.map((w: any) => w.word)?.join(' ')
+          )
+        console.log('------------- data -------------')
+      })
+  }
+}
+
+interface TwilioWebsocketMessage {
+  event: 'connected' | 'start' | 'media' | 'stop'
+  sequenceNumber: number
+  streamSid: string
+  start?: TwilioWebsocketMessageStart
+  media?: TwilioWebsocketMessageMedia
+  stop?: TwilioWebsocketMessageStop
+}
+
+/**
+ * The start message contains metadata about the Stream and is sent immediately after
+ * the connected message. It is only sent once at the start of the Stream.
+ */
+interface TwilioWebsocketMessageStart {
+  streamSid: string
+  callSid: string
+  mediaFormat: MediaFormat
+}
+
+/** This message type encapsulates the raw audio data. */
+interface TwilioWebsocketMessageMedia {
+  track: 'inbound' | 'outbound'
+  /** The chunk for the message. The first message will begin with 1 and
+   * increment with each subsequent message.
+   **/
+  chunk: number
+  /** Raw audio in encoded base64 */
+  payload: string
+}
+
+interface TwilioWebsocketMessageStop {
+  /** The Account identifier that created the Stream */
+  accountSid: string
+  /** The Call identifier that started the Stream */
+  callSid: string
+}
+
+interface MediaFormat {
+  /** The encoding of the data in the upcoming payload. Value is always audio/x-mulaw. */
+  encoding: string
+  /** The sample rate in hertz of the upcoming audio data. Value is always 8000 */
+  sampleRate: number
+  /** The number of channels in the input audio data. Value is always 1 */
+  channels: number
 }
